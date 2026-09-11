@@ -6,7 +6,10 @@ import { ENV } from "./_core/env";
 import { invokeLLM } from "./_core/llm";
 import { systemRouter } from "./_core/systemRouter";
 import { protectedProcedure, publicProcedure, router } from "./_core/trpc";
-import { getTrustedMembership, getWorkspaceSummary, listPublishedAssessments, provisionOrganization, reviewEvidence, startAssessmentAttempt, submitAssessmentAttempt } from "./db";
+import { storageGetSignedUrl, storagePut } from "./storage";
+import { scanBuffer } from "./security/fileScan";
+import { seedOfficialImdCatalog } from "./imdCatalog";
+import { createEvidenceRecord, getAssessmentAttemptDetail, getEvidenceById, getTrustedMembership, getWorkspaceSummary, listAssessmentReviewQueue, listEvidenceForReview, listPublishedAssessments, provisionOrganization, reviewAssessmentAttempt, reviewEvidence, startAssessmentAttempt, submitAssessmentAttempt } from "./db";
 
 const requireMembership = async (userId: number) => {
   const membership = await getTrustedMembership(userId);
@@ -19,6 +22,8 @@ const requireRole = async (userId: number, roles: Array<"trainee" | "trainer" | 
   if (!roles.includes(membership.membership.role)) throw new TRPCError({ code: "FORBIDDEN", message: "Your organization role cannot perform this operation" });
   return membership;
 };
+
+const safeFileName = (name: string) => name.replace(/[^a-zA-Z0-9._-]/g, "-").slice(0, 160);
 
 export const appRouter = router({
   system: systemRouter,
@@ -41,6 +46,10 @@ export const appRouter = router({
       if (await getTrustedMembership(ctx.user.id)) throw new TRPCError({ code: "CONFLICT", message: "An active workspace already exists for this account" });
       return provisionOrganization({ ownerUserId: ctx.user.id, ...input });
     }),
+    seedOfficialImd: protectedProcedure.mutation(async ({ ctx }) => {
+      const membership = await requireRole(ctx.user.id, ["admin"]);
+      return seedOfficialImdCatalog({ organizationId: membership.membership.organizationId, actorUserId: ctx.user.id });
+    }),
   }),
   assessmentGateway: router({
     listPublished: protectedProcedure.query(async ({ ctx }) => {
@@ -51,12 +60,47 @@ export const appRouter = router({
       const membership = await requireRole(ctx.user.id, ["trainee"]);
       return startAssessmentAttempt({ organizationId: membership.membership.organizationId, assessmentId: input.assessmentId, userId: ctx.user.id });
     }),
+    getAttempt: protectedProcedure.input(z.object({ attemptId: z.number().int().positive() })).query(async ({ ctx, input }) => {
+      const membership = await requireRole(ctx.user.id, ["trainee"]);
+      return getAssessmentAttemptDetail({ organizationId: membership.membership.organizationId, attemptId: input.attemptId, userId: ctx.user.id });
+    }),
     submitAttempt: protectedProcedure.input(z.object({ attemptId: z.number().int().positive(), answers: z.record(z.string(), z.unknown()) })).mutation(async ({ ctx, input }) => {
       const membership = await requireRole(ctx.user.id, ["trainee"]);
       return submitAssessmentAttempt({ organizationId: membership.membership.organizationId, userId: ctx.user.id, ...input });
     }),
+    reviewQueue: protectedProcedure.query(async ({ ctx }) => {
+      const membership = await requireRole(ctx.user.id, ["trainer", "admin"]);
+      return listAssessmentReviewQueue(membership.membership.organizationId);
+    }),
+    reviewAttempt: protectedProcedure.input(z.object({ attemptId: z.number().int().positive(), outcome: z.enum(["completed", "rejected"]), scorePercent: z.number().int().min(0).max(100), rubric: z.record(z.string(), z.number().int().min(0).max(5)), notes: z.string().max(4000).optional(), validatedLevel: z.number().int().min(0).max(4).optional() })).mutation(async ({ ctx, input }) => {
+      const membership = await requireRole(ctx.user.id, ["trainer", "admin"]);
+      return reviewAssessmentAttempt({ organizationId: membership.membership.organizationId, reviewerId: ctx.user.id, ...input });
+    }),
   }),
   evidenceGateway: router({
+    listForReview: protectedProcedure.query(async ({ ctx }) => {
+      const membership = await requireRole(ctx.user.id, ["trainer", "admin"]);
+      return listEvidenceForReview(membership.membership.organizationId);
+    }),
+    upload: protectedProcedure.input(z.object({ fileName: z.string().min(1).max(180), contentType: z.string().max(120), fileBase64: z.string().min(1).max(15_000_000), title: z.string().min(3).max(220), competencyId: z.number().int().positive(), evidenceType: z.enum(["certificate", "qualification", "work_experience", "project", "practical_task", "trainer_evaluation", "uploaded_artifact"]), claimedLevel: z.number().int().min(0).max(4) })).mutation(async ({ ctx, input }) => {
+      const membership = await requireRole(ctx.user.id, ["trainee", "trainer", "admin"]);
+      const buffer = Buffer.from(input.fileBase64, "base64");
+      if (buffer.length > 10 * 1024 * 1024) throw new TRPCError({ code: "BAD_REQUEST", message: "Evidence files must be 10 MB or smaller" });
+      const scan = await scanBuffer(buffer, input.contentType);
+      if (!scan.clean) {
+        return { accepted: false as const, scanStatus: "quarantined" as const, provider: scan.provider, message: scan.message };
+      }
+      const stored = await storagePut(`private-evidence/${membership.membership.organizationId}/${ctx.user.id}/${Date.now()}-${safeFileName(input.fileName)}`, buffer, input.contentType);
+      const created = await createEvidenceRecord({ organizationId: membership.membership.organizationId, userId: ctx.user.id, storageKey: stored.key, mimeType: input.contentType, sizeBytes: buffer.length, sha256: scan.sha256, scanStatus: "clean", scanProvider: scan.provider, scanMessage: scan.message, title: input.title, competencyId: input.competencyId, evidenceType: input.evidenceType, claimedLevel: input.claimedLevel });
+      return { accepted: true as const, scanStatus: "clean" as const, evidence: created };
+    }),
+    downloadUrl: protectedProcedure.input(z.object({ evidenceId: z.number().int().positive() })).query(async ({ ctx, input }) => {
+      const membership = await requireMembership(ctx.user.id);
+      const item = await getEvidenceById({ organizationId: membership.membership.organizationId, evidenceId: input.evidenceId });
+      if (!item || item.scanStatus !== "clean" || !item.storageKey) throw new TRPCError({ code: "NOT_FOUND", message: "Evidence is not available for download" });
+      if (item.userId !== ctx.user.id && !["trainer", "admin"].includes(membership.membership.role)) throw new TRPCError({ code: "FORBIDDEN", message: "You cannot access this evidence" });
+      return { url: await storageGetSignedUrl(item.storageKey) };
+    }),
     review: protectedProcedure.input(z.object({ evidenceId: z.number().int().positive(), toStatus: z.enum(["verified", "rejected", "under_review"]), validatedLevel: z.number().int().min(0).max(4).optional(), notes: z.string().max(4000).optional() })).mutation(async ({ ctx, input }) => {
       const membership = await requireRole(ctx.user.id, ["trainer", "admin"]);
       return reviewEvidence({ organizationId: membership.membership.organizationId, reviewerId: ctx.user.id, ...input });
@@ -65,13 +109,7 @@ export const appRouter = router({
   intelligenceGateway: router({
     explainRecommendation: protectedProcedure.input(z.object({ gap: z.string().max(180), targetLevel: z.number().int().min(0).max(4), currentLevel: z.number().int().min(0).max(4), courseTitle: z.string().max(220) })).mutation(async ({ input }) => {
       try {
-        const result = await invokeLLM({
-          messages: [
-            { role: "system", content: "You explain competency learning recommendations. Do not make verification, employment, approval, or eligibility decisions. Return one concise plain-text explanation grounded only in the provided facts." },
-            { role: "user", content: `Gap: ${input.gap}\nCurrent level: ${input.currentLevel}\nTarget level: ${input.targetLevel}\nCourse: ${input.courseTitle}\nExplain why this course is relevant in one sentence.` },
-          ],
-          maxTokens: 120,
-        });
+        const result = await invokeLLM({ messages: [{ role: "system", content: "You explain competency learning recommendations. Do not make verification, employment, approval, or eligibility decisions. Return one concise plain-text explanation grounded only in the provided facts." }, { role: "user", content: `Gap: ${input.gap}\nCurrent level: ${input.currentLevel}\nTarget level: ${input.targetLevel}\nCourse: ${input.courseTitle}\nExplain why this course is relevant in one sentence.` }], maxTokens: 120 });
         const content = result.choices[0]?.message.content;
         return { enabled: true as const, explanation: typeof content === "string" ? content : "This course is mapped to the competency gap and target level." };
       } catch {

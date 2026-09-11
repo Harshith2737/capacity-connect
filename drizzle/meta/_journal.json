@@ -15,6 +15,13 @@
       "when": 1789146065920,
       "tag": "0001_daffy_amazoness",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "5",
+      "when": 1789147391706,
+      "tag": "0002_previous_preak",
+      "breakpoints": true
     }
   ]
 }

@@ -26,6 +26,8 @@ export const departments = mysqlTable("departments", {
   id: int("id").autoincrement().primaryKey(),
   organizationId: int("organizationId").notNull(),
   name: varchar("name", { length: 180 }).notNull(),
+  sourceLabel: varchar("sourceLabel", { length: 180 }),
+  sourceUrl: varchar("sourceUrl", { length: 500 }),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
 }, (table) => ({ organizationIdx: index("departments_organization_idx").on(table.organizationId) }));
 
@@ -55,6 +57,8 @@ export const competencies = mysqlTable("competencies", {
   name: varchar("name", { length: 180 }).notNull(),
   category: varchar("category", { length: 100 }).notNull(),
   description: text("description"),
+  sourceLabel: varchar("sourceLabel", { length: 180 }),
+  sourceUrl: varchar("sourceUrl", { length: 500 }),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
 }, (table) => ({ tenantNameIdx: uniqueIndex("competencies_tenant_name_idx").on(table.organizationId, table.name) }));
 
@@ -124,6 +128,7 @@ export const assessments = mysqlTable("assessments", {
   timeLimitSeconds: int("timeLimitSeconds"),
   passMarkPercent: int("passMarkPercent").default(70).notNull(),
   attemptLimit: int("attemptLimit").default(3).notNull(),
+  rubricJson: text("rubricJson"),
   status: mysqlEnum("status", ["draft", "review", "published", "archived"]).default("draft").notNull(),
   version: int("version").default(1).notNull(),
   createdBy: int("createdBy").notNull(),
@@ -150,12 +155,29 @@ export const assessmentAttempts = mysqlTable("assessment_attempts", {
   assessmentId: int("assessmentId").notNull(),
   userId: int("userId").notNull(),
   status: mysqlEnum("status", ["started", "submitted", "scored", "expired", "invalidated"]).default("started").notNull(),
+  reviewStatus: mysqlEnum("reviewStatus", ["not_required", "pending", "completed", "rejected"]).default("not_required").notNull(),
+  answersJson: text("answersJson"),
   scorePercent: int("scorePercent"),
+  reviewScore: int("reviewScore"),
+  reviewNotes: text("reviewNotes"),
   passed: int("passed"),
   startedAt: timestamp("startedAt").defaultNow().notNull(),
+  expiresAt: timestamp("expiresAt"),
   submittedAt: timestamp("submittedAt"),
   scoredAt: timestamp("scoredAt"),
-}, (table) => ({ attemptUserIdx: index("assessment_attempt_user_idx").on(table.organizationId, table.userId, table.assessmentId) }));
+}, (table) => ({ attemptUserIdx: index("assessment_attempt_user_idx").on(table.organizationId, table.userId, table.assessmentId), reviewQueueIdx: index("assessment_attempt_review_idx").on(table.organizationId, table.reviewStatus) }));
+
+export const assessmentReviews = mysqlTable("assessment_reviews", {
+  id: int("id").autoincrement().primaryKey(),
+  organizationId: int("organizationId").notNull(),
+  attemptId: int("attemptId").notNull(),
+  reviewerId: int("reviewerId").notNull(),
+  outcome: mysqlEnum("outcome", ["completed", "rejected"]).notNull(),
+  scorePercent: int("scorePercent").notNull(),
+  rubricJson: text("rubricJson"),
+  notes: text("notes"),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+}, (table) => ({ attemptReviewIdx: index("assessment_reviews_attempt_idx").on(table.organizationId, table.attemptId) }));
 
 export const evidence = mysqlTable("evidence", {
   id: int("id").autoincrement().primaryKey(),
@@ -165,11 +187,18 @@ export const evidence = mysqlTable("evidence", {
   evidenceType: mysqlEnum("evidenceType", ["assessment", "certificate", "qualification", "work_experience", "project", "practical_task", "trainer_evaluation", "uploaded_artifact"]).notNull(),
   title: varchar("title", { length: 220 }).notNull(),
   storageKey: varchar("storageKey", { length: 500 }),
+  mimeType: varchar("mimeType", { length: 120 }),
+  sizeBytes: int("sizeBytes"),
+  sha256: varchar("sha256", { length: 64 }),
+  scanStatus: mysqlEnum("scanStatus", ["pending", "scanning", "clean", "quarantined", "failed"]).default("pending").notNull(),
+  scanProvider: varchar("scanProvider", { length: 120 }),
+  scanMessage: text("scanMessage"),
+  scannedAt: timestamp("scannedAt"),
   claimedLevel: int("claimedLevel").notNull(),
   status: mysqlEnum("status", ["submitted", "under_review", "verified", "rejected", "expired"]).default("submitted").notNull(),
   submittedAt: timestamp("submittedAt").defaultNow().notNull(),
   verifiedAt: timestamp("verifiedAt"),
-}, (table) => ({ evidenceUserIdx: index("evidence_user_idx").on(table.organizationId, table.userId, table.status) }));
+}, (table) => ({ evidenceUserIdx: index("evidence_user_idx").on(table.organizationId, table.userId, table.status), evidenceScanIdx: index("evidence_scan_idx").on(table.organizationId, table.scanStatus) }));
 
 export const evidenceReviews = mysqlTable("evidence_reviews", {
   id: int("id").autoincrement().primaryKey(),
@@ -202,4 +231,6 @@ export type Organization = typeof organizations.$inferSelect;
 export type Membership = typeof memberships.$inferSelect;
 export type Competency = typeof competencies.$inferSelect;
 export type Assessment = typeof assessments.$inferSelect;
+export type AssessmentAttempt = typeof assessmentAttempts.$inferSelect;
 export type Evidence = typeof evidence.$inferSelect;
+export type AssessmentReview = typeof assessmentReviews.$inferSelect;
