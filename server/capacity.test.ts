@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { calculateGap, calculateReadiness, calculateTrainerMatch } from "../shared/capacity";
+import { hashAnswer } from "./db";
 
 describe("capacity engine", () => {
   it("calculates readiness from validated levels and role targets", () => {
@@ -24,5 +25,10 @@ describe("capacity engine", () => {
   it("uses the documented transparent trainer weights", () => {
     expect(calculateTrainerMatch({ competencyFit: 100, domainExperience: 80, assessmentQuality: 80, deliveryQuality: 80, availability: 80, recency: 80 })).toBe(87);
     expect(calculateTrainerMatch({ competencyFit: 0, domainExperience: 0, assessmentQuality: 0, deliveryQuality: 0, availability: 0, recency: 0 })).toBe(0);
+  });
+
+  it("normalizes answer hashing without storing plaintext answer keys", () => {
+    expect(hashAnswer(" Option A ")).toBe(hashAnswer("option a"));
+    expect(hashAnswer("Option A")).not.toBe(hashAnswer("Option B"));
   });
 });

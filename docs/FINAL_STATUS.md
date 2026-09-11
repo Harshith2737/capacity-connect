@@ -1,27 +1,33 @@
-# Capacity Connect — Final Status
+# Capacity Connect — Expanded Production Foundation Status
 
-## What was built
+## What was added
 
-A polished, responsive Capacity Connect command centre for the SIH 2026 problem statement 26075. The product slice includes a trainee capability dashboard, readiness calculation, competency gap list, recommended learning paths, skill passport, evidence review workflow, trainer capacity view, and organisation-level capability map.
+The original SIH command centre was extended with a production-oriented backend foundation: tenant-scoped organizations, departments, memberships, roles, competencies, role requirements, user competency records, courses, enrollments, assessments, questions, attempts, evidence, evidence reviews, and audit logs. The migration was applied successfully to the project database.
 
-## What is real in this slice
+The client now calls the live workspace and assessment gateway when an authenticated user is present, while preserving a clearly labeled synthetic demo state when no live tenant is provisioned. The assessment gateway supports multiple modalities in the product contract rather than treating MCQ as the entire assessment domain.
 
-The readiness number is calculated from the four displayed competency records. Starting a learning path updates the current scenario. Verifying evidence changes Radar Interpretation from self-declared to trainer verified and updates the readiness signal. Course search is interactive, the capability map cells are actionable, and the trainer recommendation factors are explicitly shown.
+## Security and integrity
 
-## Honest limitations
+Server-side procedures resolve active membership from the authenticated account and do not trust organization IDs from the browser. Assessment attempts are tenant- and user-scoped, limited by policy, and scored from server-held answer hashes. Evidence review is role-gated for trainer/admin members, records before/after review state, and updates validated competency only through the review service.
 
-This delivery is a synthetic-data SIH demo slice. It does not claim production persistence, real IMD data, full authentication flows, or server-side role enforcement yet. Those are reserved for the next implementation phase using the already-initialized database, tRPC, and Manus OAuth scaffold. This is deliberate: no browser state or static JSON is presented as a secure backend.
+## Configured capabilities
+
+The running environment reports database availability and built-in server capabilities for storage, notifications, and AI. The optional intelligence procedure uses the existing server-side forge configuration only for human-readable recommendation explanations. It has a deterministic fallback and cannot perform verification or eligibility decisions. No external Gmail, Supabase, or other project connector was configured in this session, so none is falsely claimed.
+
+## Assessment hosting decision
+
+Assessment is isolated behind a versioned gateway interface and tRPC namespace. It runs in-process for the current deployment and can be moved to a separately hosted service by setting `ASSESSMENT_GATEWAY_URL` and implementing the same contract. A second deployment is intentionally not claimed until independent scaling, proctoring, or runtime isolation is an actual requirement.
 
 ## Verification
 
-- TypeScript: no errors after the JSX correction.
-- UI: desktop preview captured at 1440 × 1000 and reviewed.
-- Unit tests: readiness, gap, and trainer matching rules added in `server/capacity.test.ts`.
+- Database migration: applied successfully.
+- `/health`: 200 and liveness response verified.
+- `/ready`: 200 with database available and gateway capability flags.
+- Unit tests: 6 passing across auth, competency calculations, trainer matching, and answer hashing.
+- TypeScript: clean.
+- Production build: successful.
+- Desktop preview: reviewed after the gateway navigation update.
 
-## Next release priorities
+## Known limitations
 
-1. Persist the seed scenario in normalized tenant-scoped tables.
-2. Implement protected tRPC queries and mutations for the trainee flow.
-3. Add trainer and admin role shells with server-side authorization.
-4. Add browser E2E coverage for the SIH demonstration journey.
-5. Add audit, campaign, certificate, and notification modules incrementally.
+The product still needs real organization-specific data onboarding, production user approval flows, object-storage upload signing and malware scanning, notification outbox processing, complete assessment submission UI, trainer availability data, certificate generation, and browser E2E coverage. Those are explicitly documented as the next production increments rather than being presented as complete.

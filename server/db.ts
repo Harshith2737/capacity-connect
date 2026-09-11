@@ -1,92 +1,146 @@
-import { eq } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
+import { createHash } from "node:crypto";
 import { drizzle } from "drizzle-orm/mysql2";
-import { InsertUser, users } from "../drizzle/schema";
-import { ENV } from './_core/env';
+import { InsertUser, assessments, assessmentAttempts, assessmentQuestions, auditLogs, evidence, evidenceReviews, memberships, users, userCompetencies, competencies, organizations, courses, enrollments } from "../drizzle/schema";
+import { ENV } from "./_core/env";
 
 let _db: ReturnType<typeof drizzle> | null = null;
 
-// Lazily create the drizzle instance so local tooling can run without a DB.
 export async function getDb() {
   if (!_db && process.env.DATABASE_URL) {
-    try {
-      _db = drizzle(process.env.DATABASE_URL);
-    } catch (error) {
-      console.warn("[Database] Failed to connect:", error);
-      _db = null;
-    }
+    try { _db = drizzle(process.env.DATABASE_URL); }
+    catch (error) { console.warn("[Database] Failed to connect:", error); _db = null; }
   }
   return _db;
 }
 
 export async function upsertUser(user: InsertUser): Promise<void> {
-  if (!user.openId) {
-    throw new Error("User openId is required for upsert");
-  }
-
+  if (!user.openId) throw new Error("User openId is required for upsert");
   const db = await getDb();
-  if (!db) {
-    console.warn("[Database] Cannot upsert user: database not available");
-    return;
+  if (!db) { console.warn("[Database] Cannot upsert user: database not available"); return; }
+  const values: InsertUser = { openId: user.openId };
+  const updateSet: Record<string, unknown> = {};
+  const textFields = ["name", "email", "loginMethod"] as const;
+  for (const field of textFields) {
+    if (user[field] !== undefined) { values[field] = user[field] ?? null; updateSet[field] = user[field] ?? null; }
   }
-
-  try {
-    const values: InsertUser = {
-      openId: user.openId,
-    };
-    const updateSet: Record<string, unknown> = {};
-
-    const textFields = ["name", "email", "loginMethod"] as const;
-    type TextField = (typeof textFields)[number];
-
-    const assignNullable = (field: TextField) => {
-      const value = user[field];
-      if (value === undefined) return;
-      const normalized = value ?? null;
-      values[field] = normalized;
-      updateSet[field] = normalized;
-    };
-
-    textFields.forEach(assignNullable);
-
-    if (user.lastSignedIn !== undefined) {
-      values.lastSignedIn = user.lastSignedIn;
-      updateSet.lastSignedIn = user.lastSignedIn;
-    }
-    if (user.role !== undefined) {
-      values.role = user.role;
-      updateSet.role = user.role;
-    } else if (user.openId === ENV.ownerOpenId) {
-      values.role = 'admin';
-      updateSet.role = 'admin';
-    }
-
-    if (!values.lastSignedIn) {
-      values.lastSignedIn = new Date();
-    }
-
-    if (Object.keys(updateSet).length === 0) {
-      updateSet.lastSignedIn = new Date();
-    }
-
-    await db.insert(users).values(values).onDuplicateKeyUpdate({
-      set: updateSet,
-    });
-  } catch (error) {
-    console.error("[Database] Failed to upsert user:", error);
-    throw error;
-  }
+  values.lastSignedIn = user.lastSignedIn ?? new Date();
+  updateSet.lastSignedIn = values.lastSignedIn;
+  if (user.role !== undefined || user.openId === ENV.ownerOpenId) { values.role = user.role ?? "admin"; updateSet.role = values.role; }
+  await db.insert(users).values(values).onDuplicateKeyUpdate({ set: updateSet });
 }
 
 export async function getUserByOpenId(openId: string) {
   const db = await getDb();
-  if (!db) {
-    console.warn("[Database] Cannot get user: database not available");
-    return undefined;
-  }
-
+  if (!db) return undefined;
   const result = await db.select().from(users).where(eq(users.openId, openId)).limit(1);
-
-  return result.length > 0 ? result[0] : undefined;
+  return result[0];
 }
 
-// TODO: add feature queries here as your schema grows.
+export async function getTrustedMembership(userId: number) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const result = await db.select({ membership: memberships, organization: organizations }).from(memberships)
+    .innerJoin(organizations, eq(memberships.organizationId, organizations.id))
+    .where(and(eq(memberships.userId, userId), eq(memberships.status, "active"))).limit(1);
+  return result[0];
+}
+
+export async function provisionOrganization(input: { ownerUserId: number; name: string; slug: string }) {
+  const db = await getDb();
+  if (!db) throw new Error("Database unavailable");
+  const existing = await db.select().from(organizations).where(eq(organizations.slug, input.slug)).limit(1);
+  if (existing[0]) throw new Error("Organization slug is already in use");
+  await db.insert(organizations).values({ name: input.name, slug: input.slug, mode: "imd_government", status: "active" });
+  const organization = await db.select().from(organizations).where(eq(organizations.slug, input.slug)).limit(1);
+  if (!organization[0]) throw new Error("Organization could not be created");
+  await db.insert(memberships).values({ organizationId: organization[0].id, userId: input.ownerUserId, role: "admin", status: "active", approvedAt: new Date() });
+  await recordAudit({ organizationId: organization[0].id, actorUserId: input.ownerUserId, action: "organization.provisioned", targetType: "organization", targetId: String(organization[0].id), after: { name: input.name, slug: input.slug } });
+  return organization[0];
+}
+
+export async function getWorkspaceSummary(userId: number) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const trusted = await getTrustedMembership(userId);
+  if (!trusted) return undefined;
+  const organizationId = trusted.membership.organizationId;
+  const [competencyRows, assessmentRows, evidenceRows, courseRows, enrollmentRows] = await Promise.all([
+    db.select().from(competencies).where(eq(competencies.organizationId, organizationId)).limit(100),
+    db.select().from(assessments).where(eq(assessments.organizationId, organizationId)).limit(100),
+    db.select().from(evidence).where(eq(evidence.organizationId, organizationId)).orderBy(desc(evidence.submittedAt)).limit(100),
+    db.select().from(courses).where(eq(courses.organizationId, organizationId)).limit(100),
+    db.select().from(enrollments).where(eq(enrollments.organizationId, organizationId)).limit(100),
+  ]);
+  return { organization: trusted.organization, membership: trusted.membership, competencies: competencyRows, assessments: assessmentRows, evidence: evidenceRows, courses: courseRows, enrollments: enrollmentRows };
+}
+
+export async function recordAudit(input: { organizationId?: number; actorUserId?: number; action: string; targetType: string; targetId?: string; requestId?: string; before?: unknown; after?: unknown }) {
+  const db = await getDb();
+  if (!db) throw new Error("Database unavailable");
+  await db.insert(auditLogs).values({ organizationId: input.organizationId, actorUserId: input.actorUserId, action: input.action, targetType: input.targetType, targetId: input.targetId, requestId: input.requestId, beforeJson: input.before ? JSON.stringify(input.before) : undefined, afterJson: input.after ? JSON.stringify(input.after) : undefined });
+}
+
+export async function listPublishedAssessments(organizationId: number) {
+  const db = await getDb();
+  if (!db) return [];
+  return db.select().from(assessments).where(and(eq(assessments.organizationId, organizationId), eq(assessments.status, "published"))).limit(100);
+}
+
+export async function startAssessmentAttempt(input: { organizationId: number; assessmentId: number; userId: number }) {
+  const db = await getDb();
+  if (!db) throw new Error("Database unavailable");
+  const assessment = await db.select().from(assessments).where(and(eq(assessments.id, input.assessmentId), eq(assessments.organizationId, input.organizationId), eq(assessments.status, "published"))).limit(1);
+  if (!assessment[0]) throw new Error("Published assessment not found in organization");
+  const existing = await db.select().from(assessmentAttempts).where(and(eq(assessmentAttempts.organizationId, input.organizationId), eq(assessmentAttempts.assessmentId, input.assessmentId), eq(assessmentAttempts.userId, input.userId))).limit(assessment[0].attemptLimit + 1);
+  if (existing.length >= assessment[0].attemptLimit) throw new Error("Assessment attempt limit reached");
+  await db.insert(assessmentAttempts).values({ ...input, status: "started" });
+  const created = await db.select().from(assessmentAttempts).where(and(eq(assessmentAttempts.organizationId, input.organizationId), eq(assessmentAttempts.assessmentId, input.assessmentId), eq(assessmentAttempts.userId, input.userId))).orderBy(desc(assessmentAttempts.id)).limit(1);
+  return created[0];
+}
+
+export function hashAnswer(answer: unknown): string {
+  const normalized = typeof answer === "string" ? answer.trim().toLowerCase() : JSON.stringify(answer);
+  return createHash("sha256").update(normalized).digest("hex");
+}
+
+export async function submitAssessmentAttempt(input: { organizationId: number; attemptId: number; userId: number; answers: Record<string, unknown> }) {
+  const db = await getDb();
+  if (!db) throw new Error("Database unavailable");
+  const attempt = await db.select().from(assessmentAttempts).where(and(eq(assessmentAttempts.id, input.attemptId), eq(assessmentAttempts.organizationId, input.organizationId), eq(assessmentAttempts.userId, input.userId))).limit(1);
+  if (!attempt[0] || attempt[0].status !== "started") throw new Error("Assessment attempt is invalid or already submitted");
+  const assessment = await db.select().from(assessments).where(and(eq(assessments.id, attempt[0].assessmentId), eq(assessments.organizationId, input.organizationId))).limit(1);
+  const questions = await db.select().from(assessmentQuestions).where(and(eq(assessmentQuestions.assessmentId, attempt[0].assessmentId), eq(assessmentQuestions.organizationId, input.organizationId))).limit(200);
+  if (!assessment[0] || questions.length === 0) throw new Error("Assessment has no scorable questions");
+  let earned = 0;
+  let possible = 0;
+  for (const question of questions) {
+    possible += question.points;
+    if (question.answerKeyHash && input.answers[String(question.id)] !== undefined && hashAnswer(input.answers[String(question.id)]) === question.answerKeyHash) earned += question.points;
+  }
+  const scorePercent = Math.round((earned / possible) * 100);
+  const passed = scorePercent >= assessment[0].passMarkPercent;
+  await db.update(assessmentAttempts).set({ status: "scored", scorePercent, passed: passed ? 1 : 0, submittedAt: new Date(), scoredAt: new Date() }).where(and(eq(assessmentAttempts.id, input.attemptId), eq(assessmentAttempts.organizationId, input.organizationId), eq(assessmentAttempts.userId, input.userId)));
+  await recordAudit({ organizationId: input.organizationId, actorUserId: input.userId, action: "assessment.scored", targetType: "assessment_attempt", targetId: String(input.attemptId), after: { scorePercent, passed } });
+  return { attemptId: input.attemptId, status: "scored" as const, scorePercent, passed };
+}
+
+export async function reviewEvidence(input: { organizationId: number; evidenceId: number; reviewerId: number; toStatus: "verified" | "rejected" | "under_review"; validatedLevel?: number; notes?: string }) {
+  const db = await getDb();
+  if (!db) throw new Error("Database unavailable");
+  const current = await db.select().from(evidence).where(and(eq(evidence.id, input.evidenceId), eq(evidence.organizationId, input.organizationId))).limit(1);
+  if (!current[0]) throw new Error("Evidence not found in organization");
+  const nextStatus = input.toStatus;
+  await db.update(evidence).set({ status: nextStatus, verifiedAt: nextStatus === "verified" ? new Date() : null }).where(and(eq(evidence.id, input.evidenceId), eq(evidence.organizationId, input.organizationId)));
+  await db.insert(evidenceReviews).values({ organizationId: input.organizationId, evidenceId: input.evidenceId, reviewerId: input.reviewerId, fromStatus: current[0].status, toStatus: nextStatus, validatedLevel: input.validatedLevel, notes: input.notes });
+  if (nextStatus === "verified" && input.validatedLevel !== undefined) {
+    const existing = await db.select().from(userCompetencies).where(and(eq(userCompetencies.organizationId, input.organizationId), eq(userCompetencies.userId, current[0].userId), eq(userCompetencies.competencyId, current[0].competencyId))).limit(1);
+    if (existing[0]) {
+      await db.update(userCompetencies).set({ validatedLevel: Math.max(existing[0].validatedLevel, input.validatedLevel), evidenceState: "trainer_verified", verifiedAt: new Date() }).where(eq(userCompetencies.id, existing[0].id));
+    } else {
+      await db.insert(userCompetencies).values({ organizationId: input.organizationId, userId: current[0].userId, competencyId: current[0].competencyId, currentLevel: input.validatedLevel, validatedLevel: input.validatedLevel, evidenceState: "trainer_verified", verifiedAt: new Date() });
+    }
+  }
+  await recordAudit({ organizationId: input.organizationId, actorUserId: input.reviewerId, action: "evidence.reviewed", targetType: "evidence", targetId: String(input.evidenceId), before: current[0], after: { status: nextStatus, validatedLevel: input.validatedLevel } });
+  return { success: true as const, fromStatus: current[0].status, toStatus: nextStatus };
+}

@@ -6,6 +6,8 @@ import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import { registerOAuthRoutes } from "./oauth";
 import { registerStorageProxy } from "./storageProxy";
 import { appRouter } from "../routers";
+import { getDb } from "../db";
+import { integrationStatus } from "../integrations";
 import { createContext } from "./context";
 import { serveStatic, setupVite } from "./vite";
 
@@ -36,6 +38,12 @@ async function startServer() {
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
   registerStorageProxy(app);
   registerOAuthRoutes(app);
+  app.get("/health", (_req, res) => res.json({ ok: true, service: "capacity-connect", timestamp: new Date().toISOString() }));
+  app.get("/ready", async (_req, res) => {
+    const db = await getDb();
+    const ready = Boolean(db);
+    res.status(ready ? 200 : 503).json({ ready, database: ready ? "available" : "unavailable", gateways: integrationStatus() });
+  });
   // tRPC API
   app.use(
     "/api/trpc",
