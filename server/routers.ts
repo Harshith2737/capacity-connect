@@ -38,8 +38,7 @@ export const appRouter = router({
   workspace: router({
     summary: protectedProcedure.query(async ({ ctx }) => {
       const result = await getWorkspaceSummary(ctx.user.id);
-      if (!result) throw new TRPCError({ code: "FORBIDDEN", message: "Workspace is not provisioned for this account" });
-      return result;
+      return result ?? null;
     }),
     provision: protectedProcedure.input(z.object({ name: z.string().min(3).max(180), slug: z.string().min(3).max(120).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/) })).mutation(async ({ ctx, input }) => {
       if (ctx.user.openId !== ENV.ownerOpenId) throw new TRPCError({ code: "FORBIDDEN", message: "Only the configured platform owner can provision the first organization" });
@@ -53,8 +52,8 @@ export const appRouter = router({
   }),
   assessmentGateway: router({
     listPublished: protectedProcedure.query(async ({ ctx }) => {
-      const membership = await requireMembership(ctx.user.id);
-      return listPublishedAssessments(membership.membership.organizationId);
+      const membership = await getTrustedMembership(ctx.user.id);
+      return membership ? listPublishedAssessments(membership.membership.organizationId) : [];
     }),
     startAttempt: protectedProcedure.input(z.object({ assessmentId: z.number().int().positive() })).mutation(async ({ ctx, input }) => {
       const membership = await requireRole(ctx.user.id, ["trainee"]);
@@ -69,7 +68,8 @@ export const appRouter = router({
       return submitAssessmentAttempt({ organizationId: membership.membership.organizationId, userId: ctx.user.id, ...input });
     }),
     reviewQueue: protectedProcedure.query(async ({ ctx }) => {
-      const membership = await requireRole(ctx.user.id, ["trainer", "admin"]);
+      const membership = await getTrustedMembership(ctx.user.id);
+      if (!membership || !["trainer", "admin"].includes(membership.membership.role)) return [];
       return listAssessmentReviewQueue(membership.membership.organizationId);
     }),
     reviewAttempt: protectedProcedure.input(z.object({ attemptId: z.number().int().positive(), outcome: z.enum(["completed", "rejected"]), scorePercent: z.number().int().min(0).max(100), rubric: z.record(z.string(), z.number().int().min(0).max(5)), notes: z.string().max(4000).optional(), validatedLevel: z.number().int().min(0).max(4).optional() })).mutation(async ({ ctx, input }) => {
@@ -79,7 +79,8 @@ export const appRouter = router({
   }),
   evidenceGateway: router({
     listForReview: protectedProcedure.query(async ({ ctx }) => {
-      const membership = await requireRole(ctx.user.id, ["trainer", "admin"]);
+      const membership = await getTrustedMembership(ctx.user.id);
+      if (!membership || !["trainer", "admin"].includes(membership.membership.role)) return [];
       return listEvidenceForReview(membership.membership.organizationId);
     }),
     upload: protectedProcedure.input(z.object({ fileName: z.string().min(1).max(180), contentType: z.string().max(120), fileBase64: z.string().min(1).max(15_000_000), title: z.string().min(3).max(220), competencyId: z.number().int().positive(), evidenceType: z.enum(["certificate", "qualification", "work_experience", "project", "practical_task", "trainer_evaluation", "uploaded_artifact"]), claimedLevel: z.number().int().min(0).max(4) })).mutation(async ({ ctx, input }) => {
