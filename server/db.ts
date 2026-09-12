@@ -1,8 +1,9 @@
 import { and, desc, eq } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import { drizzle } from "drizzle-orm/mysql2";
-import { InsertUser, assessments, assessmentAttempts, assessmentQuestions, assessmentReviews, auditLogs, evidence, evidenceReviews, memberships, users, userCompetencies, competencies, organizations, courses, enrollments, departments, roles, roleCompetencyRequirements } from "../drizzle/schema";
+import { InsertUser, assessments, assessmentAttempts, assessmentQuestions, assessmentReviews, auditLogs, evidence, evidenceReviews, memberships, users, userCompetencies, competencies, organizations, courses, enrollments, courseModules, moduleProgress, notifications, trainerProfiles, departments, roles, roleCompetencyRequirements } from "../drizzle/schema";
 import { ENV } from "./_core/env";
+import { rankTrainerCandidates } from "../shared/trainerMatching";
 
 let _db: ReturnType<typeof drizzle> | null = null;
 
@@ -39,7 +40,7 @@ export async function getUserByOpenId(openId: string) {
 
 export async function getTrustedMembership(userId: number) {
   const db = await getDb();
-  if (!db) return undefined;
+  if (!db) throw new Error("Database unavailable: DATABASE_URL is not configured or the connection failed");
   const result = await db.select({ membership: memberships, organization: organizations }).from(memberships)
     .innerJoin(organizations, eq(memberships.organizationId, organizations.id))
     .where(and(eq(memberships.userId, userId), eq(memberships.status, "active"))).limit(1);
@@ -87,7 +88,7 @@ export async function recordAudit(input: { organizationId?: number; actorUserId?
 
 export async function listPublishedAssessments(organizationId: number) {
   const db = await getDb();
-  if (!db) return [];
+  if (!db) throw new Error("Database unavailable");
   return db.select().from(assessments).where(and(eq(assessments.organizationId, organizationId), eq(assessments.status, "published"))).limit(100);
 }
 
@@ -101,6 +102,13 @@ export async function startAssessmentAttempt(input: { organizationId: number; as
   await db.insert(assessmentAttempts).values({ ...input, status: "started" });
   const created = await db.select().from(assessmentAttempts).where(and(eq(assessmentAttempts.organizationId, input.organizationId), eq(assessmentAttempts.assessmentId, input.assessmentId), eq(assessmentAttempts.userId, input.userId))).orderBy(desc(assessmentAttempts.id)).limit(1);
   return created[0];
+}
+
+export async function getCompetencyById(input: { organizationId: number; competencyId: number }) {
+  const db = await getDb();
+  if (!db) throw new Error("Database unavailable");
+  const rows = await db.select().from(competencies).where(and(eq(competencies.organizationId, input.organizationId), eq(competencies.id, input.competencyId))).limit(1);
+  return rows[0];
 }
 
 export function hashAnswer(answer: unknown): string {
@@ -128,6 +136,7 @@ export async function submitAssessmentAttempt(input: { organizationId: number; a
   const passed = requiresReview ? undefined : scorePercent >= assessment[0].passMarkPercent;
   await db.update(assessmentAttempts).set({ status: requiresReview ? "submitted" : "scored", reviewStatus: requiresReview ? "pending" : "not_required", answersJson: JSON.stringify(input.answers), scorePercent: requiresReview ? null : scorePercent, passed: passed === undefined ? null : passed ? 1 : 0, submittedAt: new Date(), scoredAt: requiresReview ? null : new Date() }).where(and(eq(assessmentAttempts.id, input.attemptId), eq(assessmentAttempts.organizationId, input.organizationId), eq(assessmentAttempts.userId, input.userId)));
   await recordAudit({ organizationId: input.organizationId, actorUserId: input.userId, action: requiresReview ? "assessment.submitted_for_review" : "assessment.scored", targetType: "assessment_attempt", targetId: String(input.attemptId), after: { scorePercent: requiresReview ? null : scorePercent, passed, reviewStatus: requiresReview ? "pending" : "not_required" } });
+  await createNotification({ organizationId: input.organizationId, userId: input.userId, type: requiresReview ? "assessment_review_required" : passed ? "assessment_passed" : "assessment_failed", title: requiresReview ? "Assessment submitted for review" : passed ? "Assessment passed" : "Assessment needs another attempt", body: requiresReview ? "Your practical submission is waiting for trainer review." : `Your server-scored assessment result is ${scorePercent}%.` });
   return { attemptId: input.attemptId, status: requiresReview ? "submitted" as const : "scored" as const, scorePercent: requiresReview ? undefined : scorePercent, passed, reviewStatus: requiresReview ? "pending" as const : "not_required" as const };
 }
 
@@ -148,6 +157,7 @@ export async function reviewEvidence(input: { organizationId: number; evidenceId
     }
   }
   await recordAudit({ organizationId: input.organizationId, actorUserId: input.reviewerId, action: "evidence.reviewed", targetType: "evidence", targetId: String(input.evidenceId), before: current[0], after: { status: nextStatus, validatedLevel: input.validatedLevel } });
+  await createNotification({ organizationId: input.organizationId, userId: current[0].userId, type: nextStatus === "verified" ? "evidence_verified" : nextStatus === "rejected" ? "evidence_rejected" : "evidence_under_review", title: nextStatus === "verified" ? "Evidence verified" : nextStatus === "rejected" ? "Evidence needs attention" : "Evidence is under review", body: nextStatus === "verified" ? "Your evidence was verified and your competency record was refreshed." : nextStatus === "rejected" ? "Your evidence was not verified. Review the trainer notes and resubmit." : "A trainer has started reviewing your evidence." });
   return { success: true as const, fromStatus: current[0].status, toStatus: nextStatus };
 }
 
@@ -177,7 +187,7 @@ export async function createEvidenceRecord(input: {
 
 export async function listEvidenceForReview(organizationId: number) {
   const db = await getDb();
-  if (!db) return [];
+  if (!db) throw new Error("Database unavailable");
   return db.select().from(evidence).where(and(eq(evidence.organizationId, organizationId), eq(evidence.status, "submitted"))).orderBy(desc(evidence.submittedAt)).limit(100);
 }
 
@@ -193,7 +203,7 @@ export async function getAssessmentAttemptDetail(input: { organizationId: number
 
 export async function listAssessmentReviewQueue(organizationId: number) {
   const db = await getDb();
-  if (!db) return [];
+  if (!db) throw new Error("Database unavailable");
   return db.select({ attempt: assessmentAttempts, assessment: assessments }).from(assessmentAttempts)
     .innerJoin(assessments, eq(assessmentAttempts.assessmentId, assessments.id))
     .where(and(eq(assessmentAttempts.organizationId, organizationId), eq(assessmentAttempts.reviewStatus, "pending"))).orderBy(desc(assessmentAttempts.submittedAt)).limit(100);
@@ -214,6 +224,7 @@ export async function reviewAssessmentAttempt(input: { organizationId: number; a
     else await db.insert(userCompetencies).values({ organizationId: input.organizationId, userId: current[0].userId, competencyId: reviewedAssessment[0].competencyId, currentLevel: input.validatedLevel, validatedLevel: input.validatedLevel, evidenceState: "trainer_verified", verifiedAt: new Date() });
   }
   await recordAudit({ organizationId: input.organizationId, actorUserId: input.reviewerId, action: "assessment.reviewed", targetType: "assessment_attempt", targetId: String(input.attemptId), before: current[0], after: { outcome: input.outcome, scorePercent: input.scorePercent, rubric: input.rubric } });
+  await createNotification({ organizationId: input.organizationId, userId: current[0].userId, type: input.outcome === "completed" ? "assessment_passed" : "assessment_rejected", title: input.outcome === "completed" ? "Practical assessment approved" : "Practical assessment needs revision", body: input.notes ?? "Your practical assessment review has been completed." });
   return { success: true as const, outcome: input.outcome, scorePercent: input.scorePercent, passed };
 }
 
@@ -222,4 +233,112 @@ export async function getEvidenceById(input: { organizationId: number; evidenceI
   if (!db) throw new Error("Database unavailable");
   const rows = await db.select().from(evidence).where(and(eq(evidence.organizationId, input.organizationId), eq(evidence.id, input.evidenceId))).limit(1);
   return rows[0];
+}
+
+export async function listCourses(input: { organizationId: number; userId: number }) {
+  const db = await getDb();
+  if (!db) throw new Error("Database unavailable");
+  return db.select({ course: courses, enrollment: enrollments }).from(courses)
+    .leftJoin(enrollments, and(eq(enrollments.courseId, courses.id), eq(enrollments.userId, input.userId), eq(enrollments.organizationId, input.organizationId)))
+    .where(and(eq(courses.organizationId, input.organizationId), eq(courses.status, "published"))).limit(100);
+}
+
+export async function getCourse(input: { organizationId: number; userId: number; courseId: number }) {
+  const db = await getDb();
+  if (!db) throw new Error("Database unavailable");
+  const course = await db.select().from(courses).where(and(eq(courses.organizationId, input.organizationId), eq(courses.id, input.courseId), eq(courses.status, "published"))).limit(1);
+  if (!course[0]) return undefined;
+  const modules = await db.select().from(courseModules).where(and(eq(courseModules.organizationId, input.organizationId), eq(courseModules.courseId, input.courseId))).orderBy(courseModules.position).limit(100);
+  const enrollment = await db.select().from(enrollments).where(and(eq(enrollments.organizationId, input.organizationId), eq(enrollments.courseId, input.courseId), eq(enrollments.userId, input.userId))).limit(1);
+  const progress = enrollment[0] ? await db.select().from(moduleProgress).where(and(eq(moduleProgress.organizationId, input.organizationId), eq(moduleProgress.enrollmentId, enrollment[0].id))).limit(100) : [];
+  return { course: course[0], modules, enrollment: enrollment[0], progress };
+}
+
+export async function enrollInCourse(input: { organizationId: number; userId: number; courseId: number }) {
+  const db = await getDb();
+  if (!db) throw new Error("Database unavailable");
+  const course = await db.select().from(courses).where(and(eq(courses.organizationId, input.organizationId), eq(courses.id, input.courseId), eq(courses.status, "published"))).limit(1);
+  if (!course[0]) throw new Error("Published course not found in organization");
+  const existing = await db.select().from(enrollments).where(and(eq(enrollments.organizationId, input.organizationId), eq(enrollments.userId, input.userId), eq(enrollments.courseId, input.courseId))).limit(1);
+  if (existing[0]) return existing[0];
+  await db.insert(enrollments).values({ organizationId: input.organizationId, userId: input.userId, courseId: input.courseId, status: "enrolled", progressPercent: 0 });
+  const created = await db.select().from(enrollments).where(and(eq(enrollments.organizationId, input.organizationId), eq(enrollments.userId, input.userId), eq(enrollments.courseId, input.courseId))).limit(1);
+  if (created[0]) {
+    const modules = await db.select().from(courseModules).where(and(eq(courseModules.organizationId, input.organizationId), eq(courseModules.courseId, input.courseId))).limit(100);
+    if (modules.length) await db.insert(moduleProgress).values(modules.map((module) => ({ organizationId: input.organizationId, enrollmentId: created[0].id, moduleId: module.id, status: "not_started" as const })));
+    await createNotification({ organizationId: input.organizationId, userId: input.userId, type: "course_enrolled", title: "Course added to your learning path", body: `${course[0].title} is now in progress.` });
+    await recordAudit({ organizationId: input.organizationId, actorUserId: input.userId, action: "course.enrolled", targetType: "course", targetId: String(input.courseId) });
+  }
+  return created[0];
+}
+
+export async function updateModuleProgress(input: { organizationId: number; userId: number; enrollmentId: number; moduleId: number; completed: boolean }) {
+  const db = await getDb();
+  if (!db) throw new Error("Database unavailable");
+  const enrollment = await db.select().from(enrollments).where(and(eq(enrollments.organizationId, input.organizationId), eq(enrollments.id, input.enrollmentId), eq(enrollments.userId, input.userId))).limit(1);
+  if (!enrollment[0]) throw new Error("Enrollment not found");
+  await db.update(moduleProgress).set({ status: input.completed ? "completed" : "in_progress", completedAt: input.completed ? new Date() : null }).where(and(eq(moduleProgress.organizationId, input.organizationId), eq(moduleProgress.enrollmentId, input.enrollmentId), eq(moduleProgress.moduleId, input.moduleId)));
+  const all = await db.select().from(moduleProgress).where(and(eq(moduleProgress.organizationId, input.organizationId), eq(moduleProgress.enrollmentId, input.enrollmentId))).limit(100);
+  const completed = all.filter((item) => item.status === "completed").length;
+  const progressPercent = all.length ? Math.round((completed / all.length) * 100) : 0;
+  await db.update(enrollments).set({ status: progressPercent >= 100 ? "completed" : "in_progress", progressPercent, completedAt: progressPercent >= 100 ? new Date() : null }).where(eq(enrollments.id, input.enrollmentId));
+  return { progressPercent, status: progressPercent >= 100 ? "completed" as const : "in_progress" as const };
+}
+
+export async function completeCourse(input: { organizationId: number; userId: number; enrollmentId: number }) {
+  const db = await getDb();
+  if (!db) throw new Error("Database unavailable");
+  const enrollment = await db.select().from(enrollments).where(and(eq(enrollments.organizationId, input.organizationId), eq(enrollments.id, input.enrollmentId), eq(enrollments.userId, input.userId))).limit(1);
+  if (!enrollment[0] || enrollment[0].progressPercent < 100) throw new Error("Complete all course modules before completing the course");
+  if (enrollment[0].status !== "completed") await db.update(enrollments).set({ status: "completed", completedAt: new Date() }).where(eq(enrollments.id, input.enrollmentId));
+  return { ...enrollment[0], status: "completed" as const, completedAt: enrollment[0].completedAt ?? new Date() };
+}
+
+export async function createNotification(input: { organizationId: number; userId: number; type: string; title: string; body: string }) {
+  const db = await getDb();
+  if (!db) throw new Error("Database unavailable");
+  await db.insert(notifications).values(input);
+  return db.select().from(notifications).where(and(eq(notifications.organizationId, input.organizationId), eq(notifications.userId, input.userId))).orderBy(desc(notifications.id)).limit(1);
+}
+
+export async function listNotifications(input: { organizationId: number; userId: number }) {
+  const db = await getDb();
+  if (!db) throw new Error("Database unavailable");
+  return db.select().from(notifications).where(and(eq(notifications.organizationId, input.organizationId), eq(notifications.userId, input.userId))).orderBy(desc(notifications.createdAt)).limit(50);
+}
+
+export async function getOrganizationAnalytics(organizationId: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Database unavailable");
+  const [members, competenciesRows, userRecords, evidenceRows, attempts, courseRows, enrollmentRows] = await Promise.all([
+    db.select().from(memberships).where(and(eq(memberships.organizationId, organizationId), eq(memberships.status, "active"))).limit(1000),
+    db.select().from(competencies).where(eq(competencies.organizationId, organizationId)).limit(500),
+    db.select().from(userCompetencies).where(eq(userCompetencies.organizationId, organizationId)).limit(2000),
+    db.select().from(evidence).where(eq(evidence.organizationId, organizationId)).limit(2000),
+    db.select().from(assessmentAttempts).where(eq(assessmentAttempts.organizationId, organizationId)).limit(2000),
+    db.select().from(courses).where(eq(courses.organizationId, organizationId)).limit(500),
+    db.select().from(enrollments).where(eq(enrollments.organizationId, organizationId)).limit(2000),
+  ]);
+  const averageLevel = userRecords.length ? Math.round((userRecords.reduce((sum, item) => sum + item.validatedLevel, 0) / userRecords.length) * 10) / 10 : null;
+  const scoredAttempts = attempts.filter((item) => item.passed !== null);
+  const coverage = competenciesRows.map((competency) => { const records = userRecords.filter((record) => record.competencyId === competency.id); const average = records.length ? Math.round((records.reduce((sum, record) => sum + record.validatedLevel, 0) / records.length) * 10) / 10 : null; return { id: competency.id, name: competency.name, peopleTracked: records.length, averageLevel: average, averageGap: average === null ? null : Math.max(0, 3 - average), coveragePercent: average === null ? null : Math.round((average / 3) * 100) }; });
+  return { members: members.length, trainees: members.filter((item) => item.role === "trainee").length, trainers: members.filter((item) => item.role === "trainer").length, competenciesTracked: competenciesRows.length, averageLevel, criticalGapCount: userRecords.filter((item) => item.validatedLevel === 0).length, evidencePending: evidenceRows.filter((item) => item.status === "submitted" || item.status === "under_review").length, evidenceVerificationRate: evidenceRows.length ? Math.round((evidenceRows.filter((item) => item.status === "verified").length / evidenceRows.length) * 100) : null, assessmentPassRate: scoredAttempts.length ? Math.round((scoredAttempts.filter((item) => item.passed === 1).length / scoredAttempts.length) * 100) : null, courseCount: courseRows.length, courseCompletionRate: enrollmentRows.length ? Math.round((enrollmentRows.filter((item) => item.status === "completed").length / enrollmentRows.length) * 100) : null, coverage };
+}
+
+export async function upsertTrainerProfile(input: { organizationId: number; userId: number; qualifications?: string; expertise: string[]; domainExperience: number; assessmentQuality: number; deliveryQuality: number; availability: number }) {
+  const db = await getDb();
+  if (!db) throw new Error("Database unavailable");
+  const existing = await db.select().from(trainerProfiles).where(and(eq(trainerProfiles.organizationId, input.organizationId), eq(trainerProfiles.userId, input.userId))).limit(1);
+  const values = { organizationId: input.organizationId, userId: input.userId, qualifications: input.qualifications, expertiseJson: JSON.stringify(input.expertise), domainExperience: input.domainExperience, assessmentQuality: input.assessmentQuality, deliveryQuality: input.deliveryQuality, availability: input.availability };
+  if (existing[0]) await db.update(trainerProfiles).set(values).where(eq(trainerProfiles.id, existing[0].id)); else await db.insert(trainerProfiles).values(values);
+  await recordAudit({ organizationId: input.organizationId, actorUserId: input.userId, action: "trainer.profile_updated", targetType: "trainer_profile", targetId: String(input.userId), after: values });
+  return db.select().from(trainerProfiles).where(and(eq(trainerProfiles.organizationId, input.organizationId), eq(trainerProfiles.userId, input.userId))).limit(1);
+}
+
+export async function matchTrainers(input: { organizationId: number; competencyId: number; requiredLevel: number }) {
+  const db = await getDb();
+  if (!db) throw new Error("Database unavailable");
+  const rows = await db.select({ profile: trainerProfiles, user: users }).from(trainerProfiles).innerJoin(users, eq(trainerProfiles.userId, users.id)).innerJoin(memberships, eq(trainerProfiles.userId, memberships.userId)).where(and(eq(trainerProfiles.organizationId, input.organizationId), eq(memberships.organizationId, input.organizationId), eq(memberships.role, "trainer"), eq(memberships.status, "active"))).limit(200);
+  const records = await db.select().from(userCompetencies).where(and(eq(userCompetencies.organizationId, input.organizationId), eq(userCompetencies.competencyId, input.competencyId))).limit(500);
+  return rankTrainerCandidates(rows.map(({ profile, user }) => { const record = records.find((item) => item.userId === profile.userId); const recency = profile.updatedAt && Date.now() - profile.updatedAt.getTime() < 90 * 86_400_000 ? 100 : 50; return { id: user.id, name: user.name ?? user.email ?? `Trainer ${user.id}`, competencyLevel: record?.validatedLevel ?? 0, requiredLevel: input.requiredLevel, domainExperience: profile.domainExperience, assessmentQuality: profile.assessmentQuality, deliveryQuality: profile.deliveryQuality, availability: profile.availability, recency }; }));
 }

@@ -9,7 +9,7 @@ import { protectedProcedure, publicProcedure, router } from "./_core/trpc";
 import { storageGetSignedUrl, storagePut } from "./storage";
 import { scanBuffer } from "./security/fileScan";
 import { seedOfficialImdCatalog } from "./imdCatalog";
-import { createEvidenceRecord, getAssessmentAttemptDetail, getEvidenceById, getTrustedMembership, getWorkspaceSummary, listAssessmentReviewQueue, listEvidenceForReview, listPublishedAssessments, provisionOrganization, reviewAssessmentAttempt, reviewEvidence, startAssessmentAttempt, submitAssessmentAttempt } from "./db";
+import { completeCourse, createEvidenceRecord, enrollInCourse, getAssessmentAttemptDetail, getCompetencyById, getCourse, getEvidenceById, getOrganizationAnalytics, getTrustedMembership, getWorkspaceSummary, listAssessmentReviewQueue, listCourses, listEvidenceForReview, listNotifications, listPublishedAssessments, matchTrainers, provisionOrganization, reviewAssessmentAttempt, reviewEvidence, startAssessmentAttempt, submitAssessmentAttempt, updateModuleProgress, upsertTrainerProfile } from "./db";
 
 const requireMembership = async (userId: number) => {
   const membership = await getTrustedMembership(userId);
@@ -50,6 +50,23 @@ export const appRouter = router({
       return seedOfficialImdCatalog({ organizationId: membership.membership.organizationId, actorUserId: ctx.user.id });
     }),
   }),
+  course: router({
+    list: protectedProcedure.query(async ({ ctx }) => { const membership = await requireMembership(ctx.user.id); return listCourses({ organizationId: membership.membership.organizationId, userId: ctx.user.id }); }),
+    get: protectedProcedure.input(z.object({ courseId: z.number().int().positive() })).query(async ({ ctx, input }) => { const membership = await requireMembership(ctx.user.id); return getCourse({ organizationId: membership.membership.organizationId, userId: ctx.user.id, courseId: input.courseId }); }),
+    enroll: protectedProcedure.input(z.object({ courseId: z.number().int().positive() })).mutation(async ({ ctx, input }) => { const membership = await requireRole(ctx.user.id, ["trainee", "trainer", "admin"]); return enrollInCourse({ organizationId: membership.membership.organizationId, userId: ctx.user.id, ...input }); }),
+    progress: protectedProcedure.input(z.object({ enrollmentId: z.number().int().positive(), moduleId: z.number().int().positive(), completed: z.boolean() })).mutation(async ({ ctx, input }) => { const membership = await requireRole(ctx.user.id, ["trainee", "trainer", "admin"]); return updateModuleProgress({ organizationId: membership.membership.organizationId, userId: ctx.user.id, ...input }); }),
+    complete: protectedProcedure.input(z.object({ enrollmentId: z.number().int().positive() })).mutation(async ({ ctx, input }) => { const membership = await requireRole(ctx.user.id, ["trainee", "trainer", "admin"]); return completeCourse({ organizationId: membership.membership.organizationId, userId: ctx.user.id, ...input }); }),
+  }),
+  analytics: router({
+    organization: protectedProcedure.query(async ({ ctx }) => { const membership = await requireRole(ctx.user.id, ["admin"]); return getOrganizationAnalytics(membership.membership.organizationId); }),
+  }),
+  notifications: router({
+    list: protectedProcedure.query(async ({ ctx }) => { const membership = await requireMembership(ctx.user.id); return listNotifications({ organizationId: membership.membership.organizationId, userId: ctx.user.id }); }),
+  }),
+  trainer: router({
+    match: protectedProcedure.input(z.object({ competencyId: z.number().int().positive(), requiredLevel: z.number().int().min(0).max(4) })).query(async ({ ctx, input }) => { const membership = await requireMembership(ctx.user.id); return matchTrainers({ organizationId: membership.membership.organizationId, ...input }); }),
+    expertise: protectedProcedure.input(z.object({ qualifications: z.string().max(4000).optional(), expertise: z.array(z.string().min(1).max(180)).max(30), domainExperience: z.number().int().min(0).max(100), assessmentQuality: z.number().int().min(0).max(100), deliveryQuality: z.number().int().min(0).max(100), availability: z.number().int().min(0).max(100) })).mutation(async ({ ctx, input }) => { const membership = await requireRole(ctx.user.id, ["trainer"]); return upsertTrainerProfile({ organizationId: membership.membership.organizationId, userId: ctx.user.id, ...input }); }),
+  }),
   assessmentGateway: router({
     listPublished: protectedProcedure.query(async ({ ctx }) => {
       const membership = await getTrustedMembership(ctx.user.id);
@@ -85,6 +102,7 @@ export const appRouter = router({
     }),
     upload: protectedProcedure.input(z.object({ fileName: z.string().min(1).max(180), contentType: z.string().max(120), fileBase64: z.string().min(1).max(15_000_000), title: z.string().min(3).max(220), competencyId: z.number().int().positive(), evidenceType: z.enum(["certificate", "qualification", "work_experience", "project", "practical_task", "trainer_evaluation", "uploaded_artifact"]), claimedLevel: z.number().int().min(0).max(4) })).mutation(async ({ ctx, input }) => {
       const membership = await requireRole(ctx.user.id, ["trainee", "trainer", "admin"]);
+      if (!(await getCompetencyById({ organizationId: membership.membership.organizationId, competencyId: input.competencyId }))) throw new TRPCError({ code: "NOT_FOUND", message: "Competency is not part of this organization" });
       const buffer = Buffer.from(input.fileBase64, "base64");
       if (buffer.length > 10 * 1024 * 1024) throw new TRPCError({ code: "BAD_REQUEST", message: "Evidence files must be 10 MB or smaller" });
       const scan = await scanBuffer(buffer, input.contentType);

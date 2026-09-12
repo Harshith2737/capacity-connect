@@ -1,5 +1,5 @@
 import { and, eq } from "drizzle-orm";
-import { assessmentQuestions, assessments, competencies, departments, roleCompetencyRequirements, roles } from "../drizzle/schema";
+import { assessmentQuestions, assessments, competencies, courseCompetencies, courseModules, courses, departments, roleCompetencyRequirements, roles } from "../drizzle/schema";
 import { getDb, hashAnswer, recordAudit } from "./db";
 
 const ORG_SOURCE = "Official IMD organisational structure";
@@ -75,9 +75,26 @@ export async function seedOfficialImdCatalog(input: { organizationId: number; ac
     competencyCount += 1;
   }
   const radarCompetencyId = competencyIds.get("Radar Meteorology");
+  const courseTitle = "Radar Fundamentals for Forecasters";
+  const existingCourse = await db.select().from(courses).where(and(eq(courses.organizationId, input.organizationId), eq(courses.title, courseTitle))).limit(1);
+  let courseId = existingCourse[0]?.id;
+  if (!courseId) {
+    await db.insert(courses).values({ organizationId: input.organizationId, title: courseTitle, description: "A focused learning path for interpreting radar products, identifying severe-weather signatures, and communicating operational decisions.", difficulty: "foundation", durationMinutes: 260, status: "published", version: 1, createdBy: input.actorUserId });
+    courseId = (await db.select().from(courses).where(and(eq(courses.organizationId, input.organizationId), eq(courses.title, courseTitle))).limit(1))[0]?.id;
+  }
+  if (courseId && radarCompetencyId) {
+    const link = await db.select().from(courseCompetencies).where(and(eq(courseCompetencies.organizationId, input.organizationId), eq(courseCompetencies.courseId, courseId), eq(courseCompetencies.competencyId, radarCompetencyId))).limit(1);
+    if (!link[0]) await db.insert(courseCompetencies).values({ organizationId: input.organizationId, courseId, competencyId: radarCompetencyId, targetLevel: 3 });
+    const moduleRows = await db.select().from(courseModules).where(and(eq(courseModules.organizationId, input.organizationId), eq(courseModules.courseId, courseId))).limit(10);
+    if (moduleRows.length === 0) await db.insert(courseModules).values([
+      { organizationId: input.organizationId, courseId, title: "Radar foundations and products", description: "Reflectivity, velocity, scan strategy, and product selection.", position: 1, durationMinutes: 70 },
+      { organizationId: input.organizationId, courseId, title: "Severe-weather signatures", description: "Recognise structure, movement, uncertainty, and limitations.", position: 2, durationMinutes: 100 },
+      { organizationId: input.organizationId, courseId, title: "Operational briefing", description: "Turn evidence into an impact-relevant warning decision.", position: 3, durationMinutes: 90 },
+    ]);
+  }
   const existingBaseline = await db.select().from(assessments).where(and(eq(assessments.organizationId, input.organizationId), eq(assessments.title, "Radar Interpretation Baseline"))).limit(1);
   if (!existingBaseline[0]) {
-    await db.insert(assessments).values({ organizationId: input.organizationId, competencyId: radarCompetencyId, title: "Radar Interpretation Baseline", assessmentType: "mcq", timeLimitSeconds: 1800, passMarkPercent: 70, attemptLimit: 3, status: "published", version: 1, createdBy: input.actorUserId });
+    await db.insert(assessments).values({ organizationId: input.organizationId, courseId, competencyId: radarCompetencyId, title: "Radar Interpretation Baseline", assessmentType: "mcq", timeLimitSeconds: 1800, passMarkPercent: 70, attemptLimit: 3, status: "published", version: 1, createdBy: input.actorUserId });
     const created = await db.select().from(assessments).where(and(eq(assessments.organizationId, input.organizationId), eq(assessments.title, "Radar Interpretation Baseline"))).limit(1);
     const assessmentId = created[0]?.id;
     if (assessmentId) {
@@ -94,7 +111,7 @@ export async function seedOfficialImdCatalog(input: { organizationId: number; ac
   }
   const existingPractical = await db.select().from(assessments).where(and(eq(assessments.organizationId, input.organizationId), eq(assessments.title, "Forecast Briefing Practical"))).limit(1);
   if (!existingPractical[0]) {
-    await db.insert(assessments).values({ organizationId: input.organizationId, competencyId: radarCompetencyId, title: "Forecast Briefing Practical", assessmentType: "practical_task", passMarkPercent: 70, attemptLimit: 2, rubricJson: JSON.stringify({ evidence_quality: 5, technical_accuracy: 5, operational_communication: 5 }), status: "published", version: 1, createdBy: input.actorUserId });
+    await db.insert(assessments).values({ organizationId: input.organizationId, courseId, competencyId: radarCompetencyId, title: "Forecast Briefing Practical", assessmentType: "practical_task", passMarkPercent: 70, attemptLimit: 2, rubricJson: JSON.stringify({ evidence_quality: 5, technical_accuracy: 5, operational_communication: 5 }), status: "published", version: 1, createdBy: input.actorUserId });
     const created = await db.select().from(assessments).where(and(eq(assessments.organizationId, input.organizationId), eq(assessments.title, "Forecast Briefing Practical"))).limit(1);
     if (created[0]) await db.insert(assessmentQuestions).values({ organizationId: input.organizationId, assessmentId: created[0].id, competencyId: radarCompetencyId, prompt: "Prepare a short operational briefing for a severe-weather scenario. State the evidence used, uncertainty, expected impacts, warning action, and how you would communicate it to stakeholders.", questionType: "short_answer", points: 0, position: 1, explanation: "Practical work is reviewed against the trainer rubric before capability changes." });
   }

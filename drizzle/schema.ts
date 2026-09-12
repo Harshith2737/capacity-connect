@@ -42,6 +42,19 @@ export const memberships = mysqlTable("memberships", {
   createdAt: timestamp("createdAt").defaultNow().notNull(),
 }, (table) => ({ tenantUserIdx: uniqueIndex("memberships_tenant_user_idx").on(table.organizationId, table.userId), userIdx: index("memberships_user_idx").on(table.userId) }));
 
+export const trainerProfiles = mysqlTable("trainer_profiles", {
+  id: int("id").autoincrement().primaryKey(),
+  organizationId: int("organizationId").notNull(),
+  userId: int("userId").notNull(),
+  qualifications: text("qualifications"),
+  expertiseJson: text("expertiseJson"),
+  domainExperience: int("domainExperience").default(0).notNull(),
+  assessmentQuality: int("assessmentQuality").default(0).notNull(),
+  deliveryQuality: int("deliveryQuality").default(0).notNull(),
+  availability: int("availability").default(0).notNull(),
+  updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+}, (table) => ({ trainerProfileIdx: uniqueIndex("trainer_profile_idx").on(table.organizationId, table.userId) }));
+
 export const roles = mysqlTable("roles", {
   id: int("id").autoincrement().primaryKey(),
   organizationId: int("organizationId").notNull(),
@@ -117,6 +130,37 @@ export const enrollments = mysqlTable("enrollments", {
   enrolledAt: timestamp("enrolledAt").defaultNow().notNull(),
   completedAt: timestamp("completedAt"),
 }, (table) => ({ enrollmentIdx: uniqueIndex("enrollment_idx").on(table.organizationId, table.userId, table.courseId) }));
+
+export const courseModules = mysqlTable("course_modules", {
+  id: int("id").autoincrement().primaryKey(),
+  organizationId: int("organizationId").notNull(),
+  courseId: int("courseId").notNull(),
+  title: varchar("title", { length: 220 }).notNull(),
+  description: text("description"),
+  position: int("position").notNull(),
+  durationMinutes: int("durationMinutes").default(30).notNull(),
+}, (table) => ({ modulePositionIdx: uniqueIndex("course_module_position_idx").on(table.organizationId, table.courseId, table.position) }));
+
+export const moduleProgress = mysqlTable("module_progress", {
+  id: int("id").autoincrement().primaryKey(),
+  organizationId: int("organizationId").notNull(),
+  enrollmentId: int("enrollmentId").notNull(),
+  moduleId: int("moduleId").notNull(),
+  status: mysqlEnum("status", ["not_started", "in_progress", "completed"]).default("not_started").notNull(),
+  completedAt: timestamp("completedAt"),
+  updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+}, (table) => ({ moduleProgressIdx: uniqueIndex("module_progress_idx").on(table.organizationId, table.enrollmentId, table.moduleId) }));
+
+export const notifications = mysqlTable("notifications", {
+  id: int("id").autoincrement().primaryKey(),
+  organizationId: int("organizationId").notNull(),
+  userId: int("userId").notNull(),
+  type: varchar("type", { length: 80 }).notNull(),
+  title: varchar("title", { length: 220 }).notNull(),
+  body: text("body").notNull(),
+  readAt: timestamp("readAt"),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+}, (table) => ({ notificationUserIdx: index("notifications_user_idx").on(table.organizationId, table.userId, table.createdAt) }));
 
 export const assessments = mysqlTable("assessments", {
   id: int("id").autoincrement().primaryKey(),
